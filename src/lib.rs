@@ -1,6 +1,11 @@
-use std::{collections::HashMap, io};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
-use log::debug;
+use log::{debug, warn};
 
 #[derive(thiserror::Error, Debug)]
 pub enum FetchError {
@@ -9,6 +14,8 @@ pub enum FetchError {
     R(#[from] reqwest::Error),
     #[error("io err")]
     I(#[from] io::Error),
+    #[error("time err")]
+    T(#[from] std::time::SystemTimeError),
     #[error("size limit exceed")]
     S,
 }
@@ -22,9 +29,25 @@ pub struct HttpSource {
     pub should_use_proxy: bool,
     pub size_limit_bytes: Option<usize>,
     pub update_interval_seconds: Option<u64>,
+
+    pub cached_file: Arc<Mutex<Option<String>>>,
+
+    pub cache_file_path: Option<String>,
 }
 #[cfg(feature = "reqwest")]
 impl HttpSource {
+    pub fn get_url(
+        &self,
+        c: reqwest::blocking::Client,
+    ) -> reqwest::Result<reqwest::blocking::Response> {
+        let mut rb = c.get(&self.url);
+        if let Some(h) = &self.custom_request_headers {
+            for h in h.iter() {
+                rb = rb.header(&h.0, &h.1);
+            }
+        }
+        rb.send()
+    }
     pub fn set_proxy(
         &self,
         mut cb: reqwest::blocking::ClientBuilder,
@@ -37,12 +60,46 @@ impl HttpSource {
     }
 
     pub fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+        let ocf = { self.cached_file.lock().unwrap().take() };
+        if let Some(cf) = &ocf {
+            if std::fs::exists(cf)? {
+                let mut ok = true;
+                if let Some(uis) = self.update_interval_seconds {
+                    let m = std::fs::metadata(cf)?;
+                    let lu = m.modified()?;
+                    let d = SystemTime::now().duration_since(lu)?.as_secs();
+                    if d <= uis {
+                        let _ = self.cached_file.lock().unwrap().insert(cf.to_string());
+                    } else {
+                        ok = false;
+                    }
+                }
+                if ok {
+                    let s = std::fs::read_to_string(cf)?;
+                    return Ok(s.into_bytes());
+                }
+            }
+        }
+
         let mut cb = reqwest::blocking::ClientBuilder::new();
         if self.should_use_proxy {
             cb = self.set_proxy(cb)?;
         }
         let c = cb.build()?;
-        let r = c.get(&self.url).send()?;
+        let r = self.get_url(c);
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                if !self.should_use_proxy && self.proxy.is_some() {
+                    let mut cb = reqwest::blocking::ClientBuilder::new();
+                    cb = self.set_proxy(cb)?;
+                    let c = cb.build()?;
+                    self.get_url(c)?
+                } else {
+                    return Err(FetchError::R(e));
+                }
+            }
+        };
         if let Some(sl) = self.size_limit_bytes {
             if let Some(s) = r.content_length() {
                 if s as usize > sl {
@@ -51,7 +108,17 @@ impl HttpSource {
             }
         }
         let b = r.bytes()?;
-        Ok(b.to_vec())
+        let v = b.to_vec();
+        if let Some(cfp) = &self.cache_file_path {
+            let r = std::fs::write(cfp, &v);
+            match r {
+                Ok(_) => {
+                    let _ = self.cached_file.lock().unwrap().insert(cfp.to_string());
+                }
+                Err(e) => warn!("write to cache file failed, {e}"),
+            }
+        }
+        Ok(v)
     }
 }
 
