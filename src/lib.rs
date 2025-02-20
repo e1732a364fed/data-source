@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    io,
-    path::Path,
-    sync::{Arc, Mutex},
-    time::SystemTime,
-};
+use std::{collections::HashMap, io, path::Path, time::SystemTime};
 
 use log::{debug, warn};
 
@@ -19,11 +13,79 @@ pub enum FetchError {
     T(#[from] std::time::SystemTimeError),
     #[error("size limit exceed")]
     S,
+    #[error("no cache file")]
+    NC,
+    #[error("not found")]
+    NF,
+    #[error("not found in directories `{0:?}`")]
+    NFD(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct FileCache {
+    pub update_interval_seconds: Option<u64>,
+    pub cache_file_path: Option<String>,
+}
+
+impl FileCache {
+    pub fn read_cache_file(&self) -> Result<Vec<u8>, FetchError> {
+        let cf = self.cache_file_path.as_ref().unwrap();
+        let s: Vec<u8> = std::fs::read(cf)?;
+        Ok(s)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub async fn read_cache_file_async(&self) -> Result<Vec<u8>, FetchError> {
+        let cf = self.cache_file_path.as_ref().unwrap();
+
+        let content = tokio::fs::read(cf).await?;
+        Ok(content)
+    }
+
+    pub fn write_cache_file(&self, bytes: &[u8]) -> bool {
+        let cf = self.cache_file_path.as_ref().unwrap();
+        if let Err(err) = std::fs::write(cf, bytes) {
+            warn!("Failed to write cache file: {err}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub async fn write_cache_file_async(&self, bytes: &[u8]) -> bool {
+        let cf = self.cache_file_path.as_ref().unwrap();
+        if let Err(err) = tokio::fs::write(cf, bytes).await {
+            warn!("Failed to write cache file: {err}");
+            false
+        } else {
+            true
+        }
+    }
+
+    /// 检查缓存文件是否超时
+    pub fn is_cache_timeout(&self) -> Result<Option<bool>, FetchError> {
+        if let Some(cf) = &self.cache_file_path {
+            if std::fs::exists(cf)? {
+                let mut expired = false;
+                if let Some(interval) = self.update_interval_seconds {
+                    let metadata = std::fs::metadata(cf)?;
+                    let last_modified = metadata.modified()?;
+                    let elapsed = SystemTime::now().duration_since(last_modified)?.as_secs();
+                    expired = elapsed > interval;
+                }
+                return Ok(Some(expired));
+            }
+            Ok(None)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(feature = "tokio")]
 #[async_trait::async_trait]
-pub trait AsyncSource {
+pub trait AsyncSource: Send + Sync {
     async fn fetch_async(&self) -> Result<Vec<u8>, FetchError>;
 }
 
@@ -32,19 +94,46 @@ pub trait SyncSource {
 }
 
 #[cfg(feature = "tokio")]
+pub async fn fetch_with_cache_async(
+    fc: &FileCache,
+    s: &dyn AsyncSource,
+) -> Result<Vec<u8>, FetchError> {
+    if fc.is_cache_timeout()?.is_some_and(|timeout| !timeout) {
+        fc.read_cache_file_async().await
+    } else {
+        let d = s.fetch_async().await?;
+        if fc.cache_file_path.is_some() {
+            fc.write_cache_file_async(&d).await;
+        }
+        Ok(d)
+    }
+}
+pub fn fetch_with_cache(fc: &FileCache, s: &dyn SyncSource) -> Result<Vec<u8>, FetchError> {
+    if fc.is_cache_timeout()?.is_some_and(|timeout| !timeout) {
+        fc.read_cache_file()
+    } else {
+        let d = s.fetch()?;
+        if fc.cache_file_path.is_some() {
+            fc.write_cache_file(&d);
+        }
+        Ok(d)
+    }
+}
+
+#[cfg(feature = "tokio")]
 #[async_trait::async_trait]
 pub trait AsyncFolderSource: std::fmt::Debug {
     async fn get_file_content_async(
         &self,
         file_name: &std::path::Path,
-    ) -> io::Result<(Vec<u8>, Option<String>)>;
+    ) -> Result<(Vec<u8>, Option<String>), FetchError>;
 }
 
 pub trait SyncFolderSource: std::fmt::Debug {
     fn get_file_content(
         &self,
         file_name: &std::path::Path,
-    ) -> io::Result<(Vec<u8>, Option<String>)>;
+    ) -> Result<(Vec<u8>, Option<String>), FetchError>;
 }
 
 #[cfg(feature = "reqwest")]
@@ -55,9 +144,8 @@ pub struct HttpSource {
     pub custom_request_headers: Option<Vec<(String, String)>>,
     pub should_use_proxy: bool,
     pub size_limit_bytes: Option<usize>,
-    pub update_interval_seconds: Option<u64>,
-    pub cache_file_path: Option<String>,
 }
+
 #[cfg(feature = "reqwest")]
 impl HttpSource {
     pub fn get(
@@ -82,35 +170,10 @@ impl HttpSource {
         let proxy = reqwest::Proxy::http(ps)?;
         Ok(cb.proxy(proxy))
     }
-
-    pub fn is_path_timeout(&self, cf: &str) -> Result<Option<bool>, FetchError> {
-        if std::fs::exists(cf)? {
-            let mut ok = true;
-            if let Some(uis) = self.update_interval_seconds {
-                let m = std::fs::metadata(cf)?;
-                let lu = m.modified()?;
-                let d = SystemTime::now().duration_since(lu)?.as_secs();
-                if d <= uis {
-                } else {
-                    ok = false;
-                }
-            }
-            Ok(Some(!ok))
-        } else {
-            Ok(None)
-        }
-    }
 }
 #[cfg(feature = "reqwest")]
 impl SyncSource for HttpSource {
     fn fetch(&self) -> Result<Vec<u8>, FetchError> {
-        if let Some(cf) = &self.cache_file_path {
-            if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
-                let s: Vec<u8> = std::fs::read(cf)?;
-                return Ok(s);
-            }
-        }
-
         let mut cb = reqwest::blocking::ClientBuilder::new();
         if self.should_use_proxy {
             cb = self.set_proxy(cb)?;
@@ -139,13 +202,7 @@ impl SyncSource for HttpSource {
         }
         let b = r.bytes()?;
         let v = b.to_vec();
-        if let Some(cfp) = &self.cache_file_path {
-            let r = std::fs::write(cfp, &v);
-            match r {
-                Ok(_) => {}
-                Err(e) => warn!("write to cache file failed, {e}"),
-            }
-        }
+
         Ok(v)
     }
 }
@@ -179,13 +236,6 @@ impl HttpSource {
 #[async_trait::async_trait]
 impl AsyncSource for HttpSource {
     async fn fetch_async(&self) -> Result<Vec<u8>, FetchError> {
-        if let Some(cf) = &self.cache_file_path {
-            if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
-                let content = tokio::fs::read(cf).await?;
-                return Ok(content);
-            }
-        }
-
         let client_builder = reqwest::ClientBuilder::new();
         let client_builder = if self.should_use_proxy {
             self.set_proxy_async(client_builder)?
@@ -217,20 +267,21 @@ impl AsyncSource for HttpSource {
         }
 
         let bytes = response.bytes().await?.to_vec();
-        if let Some(cache_file_path) = &self.cache_file_path {
-            if let Err(err) = tokio::fs::write(cache_file_path, &bytes).await {
-                warn!("Failed to write cache file: {err}");
-            }
-        }
 
         Ok(bytes)
     }
 }
 
-#[derive(Clone, Debug)]
+pub trait GetPath {
+    fn get_path(&self) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Debug)]
 pub enum SingleFileSource {
     #[cfg(feature = "reqwest")]
-    Http(HttpSource),
+    Http(HttpSource, FileCache),
     FilePath(String),
     Inline(Vec<u8>),
 }
@@ -239,6 +290,50 @@ impl Default for SingleFileSource {
         Self::Inline(Vec::new())
     }
 }
+
+impl GetPath for SingleFileSource {
+    fn get_path(&self) -> Option<String> {
+        match self {
+            #[cfg(feature = "reqwest")]
+            SingleFileSource::Http(http_source, _fc) => Some(http_source.url.clone()),
+            SingleFileSource::FilePath(p) => Some(p.clone()),
+            SingleFileSource::Inline(_ec) => None,
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+#[async_trait::async_trait]
+impl AsyncSource for SingleFileSource {
+    async fn fetch_async(&self) -> Result<Vec<u8>, FetchError> {
+        match self {
+            #[cfg(feature = "reqwest")]
+            SingleFileSource::Http(http_source, fc) => {
+                fetch_with_cache_async(fc, http_source).await
+            }
+            SingleFileSource::FilePath(f) => {
+                let s: Vec<u8> = tokio::fs::read(f).await?;
+                Ok(s)
+            }
+            SingleFileSource::Inline(v) => Ok(v.clone()),
+        }
+    }
+}
+
+impl SyncSource for SingleFileSource {
+    fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+        match self {
+            #[cfg(feature = "reqwest")]
+            SingleFileSource::Http(http_source, fc) => fetch_with_cache(fc, http_source),
+            SingleFileSource::FilePath(f) => {
+                let s: Vec<u8> = std::fs::read(f)?;
+                Ok(s)
+            }
+            SingleFileSource::Inline(v) => Ok(v.clone()),
+        }
+    }
+}
+
 /// Defines where to get the content of the requested file name.
 ///
 /// 很多配置中 都要再加载其他外部文件,
@@ -269,7 +364,7 @@ impl DataSource {
         Ok(())
     }
 
-    pub fn read_to_string<P>(&self, file_name: P) -> io::Result<String>
+    pub fn read_to_string<P>(&self, file_name: P) -> Result<String, FetchError>
     where
         P: AsRef<std::path::Path>,
     {
@@ -284,7 +379,7 @@ impl AsyncFolderSource for DataSource {
     async fn get_file_content_async(
         &self,
         file_name: &Path,
-    ) -> io::Result<(Vec<u8>, Option<String>)> {
+    ) -> Result<(Vec<u8>, Option<String>), FetchError> {
         match self {
             DataSource::Async(source) => source.get_file_content_async(file_name).await,
 
@@ -297,15 +392,12 @@ impl AsyncFolderSource for DataSource {
                     let real_file_name = std::path::Path::new(dir).join(file_name);
 
                     if real_file_name.exists() {
-                        return tokio::fs::read(&real_file_name)
+                        return Ok(tokio::fs::read(&real_file_name)
                             .await
-                            .map(|v| (v, Some(dir.to_owned())));
+                            .map(|v| (v, Some(dir.to_owned())))?);
                     }
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("File not found in specified directories: {:?}", file_name),
-                ))
+                Err(FetchError::NFD(possible_addrs.clone()))
             }
             DataSource::StdReadFile => {
                 let s: Vec<u8> = tokio::fs::read(file_name).await?;
@@ -316,22 +408,8 @@ impl AsyncFolderSource for DataSource {
                 let r = map.get(&file_name.to_string_lossy().to_string());
 
                 match r {
-                    Some(sf) => match sf {
-                        #[cfg(feature = "reqwest")]
-                        SingleFileSource::Http(http_source) => {
-                            let r = http_source.fetch_async().await;
-                            match r {
-                                Ok(v) => Ok((v, None)),
-                                Err(e) => Err(io::Error::other(e)),
-                            }
-                        }
-                        SingleFileSource::FilePath(f) => {
-                            let s: Vec<u8> = tokio::fs::read(f).await?;
-                            Ok((s, Some(f.to_string())))
-                        }
-                        SingleFileSource::Inline(v) => Ok((v.clone(), None)),
-                    },
-                    None => Err(io::Error::new(io::ErrorKind::NotFound, "")),
+                    Some(sf) => sf.fetch_async().await.map(|d| (d, sf.get_path())),
+                    None => Err(FetchError::NF),
                 }
             }
         }
@@ -340,7 +418,7 @@ impl AsyncFolderSource for DataSource {
 
 impl SyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
-    fn get_file_content(&self, file_name: &Path) -> io::Result<(Vec<u8>, Option<String>)> {
+    fn get_file_content(&self, file_name: &Path) -> Result<(Vec<u8>, Option<String>), FetchError> {
         match self {
             DataSource::Sync(source) => source.get_file_content(file_name),
 
@@ -357,13 +435,12 @@ impl SyncFolderSource for DataSource {
                     let real_file_name = std::path::Path::new(dir).join(file_name);
 
                     if real_file_name.exists() {
-                        return std::fs::read(&real_file_name).map(|v| (v, Some(dir.to_owned())));
+                        return Ok(
+                            std::fs::read(&real_file_name).map(|v| (v, Some(dir.to_owned())))?
+                        );
                     }
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("File not found in specified directories: {:?}", file_name),
-                ))
+                Err(FetchError::NFD(possible_addrs.clone()))
             }
             DataSource::StdReadFile => {
                 let s: Vec<u8> = std::fs::read(file_name)?;
@@ -374,22 +451,8 @@ impl SyncFolderSource for DataSource {
                 let r = map.get(&file_name.to_string_lossy().to_string());
 
                 match r {
-                    Some(sf) => match sf {
-                        #[cfg(feature = "reqwest")]
-                        SingleFileSource::Http(http_source) => {
-                            let r = http_source.fetch();
-                            match r {
-                                Ok(v) => Ok((v, None)),
-                                Err(e) => Err(io::Error::other(e)),
-                            }
-                        }
-                        SingleFileSource::FilePath(f) => {
-                            let s: Vec<u8> = std::fs::read(f)?;
-                            Ok((s, Some(f.to_string())))
-                        }
-                        SingleFileSource::Inline(v) => Ok((v.clone(), None)),
-                    },
-                    None => Err(io::Error::new(io::ErrorKind::NotFound, "")),
+                    Some(sf) => sf.fetch().map(|d| (d, sf.get_path())),
+                    None => Err(FetchError::NF),
                 }
             }
         }
@@ -400,7 +463,7 @@ impl SyncFolderSource for DataSource {
 pub fn get_file_from_tar<P>(
     file_name_in_tar: P,
     tar_binary: &Vec<u8>,
-) -> io::Result<(Vec<u8>, Option<String>)>
+) -> Result<(Vec<u8>, Option<String>), FetchError>
 where
     P: AsRef<std::path::Path>,
 {
