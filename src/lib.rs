@@ -56,11 +56,6 @@ pub struct HttpSource {
     pub should_use_proxy: bool,
     pub size_limit_bytes: Option<usize>,
     pub update_interval_seconds: Option<u64>,
-
-    pub cached_file: Arc<Mutex<Option<String>>>,
-    #[cfg(feature = "tokio")]
-    pub async_cached_file: Arc<tokio::sync::Mutex<Option<String>>>,
-
     pub cache_file_path: Option<String>,
 }
 #[cfg(feature = "reqwest")]
@@ -96,7 +91,6 @@ impl HttpSource {
                 let lu = m.modified()?;
                 let d = SystemTime::now().duration_since(lu)?.as_secs();
                 if d <= uis {
-                    let _ = self.cached_file.lock().unwrap().insert(cf.to_string());
                 } else {
                     ok = false;
                 }
@@ -110,8 +104,7 @@ impl HttpSource {
 #[cfg(feature = "reqwest")]
 impl SyncSource for HttpSource {
     fn fetch(&self) -> Result<Vec<u8>, FetchError> {
-        let ocf = { self.cached_file.lock().unwrap().take() };
-        if let Some(cf) = &ocf {
+        if let Some(cf) = &self.cache_file_path {
             if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
                 let s: Vec<u8> = std::fs::read(cf)?;
                 return Ok(s);
@@ -149,9 +142,7 @@ impl SyncSource for HttpSource {
         if let Some(cfp) = &self.cache_file_path {
             let r = std::fs::write(cfp, &v);
             match r {
-                Ok(_) => {
-                    let _ = self.cached_file.lock().unwrap().insert(cfp.to_string());
-                }
+                Ok(_) => {}
                 Err(e) => warn!("write to cache file failed, {e}"),
             }
         }
@@ -188,8 +179,7 @@ impl HttpSource {
 #[async_trait::async_trait]
 impl AsyncSource for HttpSource {
     async fn fetch_async(&self) -> Result<Vec<u8>, FetchError> {
-        let ocf = { self.async_cached_file.lock().await.clone() };
-        if let Some(cf) = &ocf {
+        if let Some(cf) = &self.cache_file_path {
             if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
                 let content = tokio::fs::read(cf).await?;
                 return Ok(content);
@@ -230,9 +220,6 @@ impl AsyncSource for HttpSource {
         if let Some(cache_file_path) = &self.cache_file_path {
             if let Err(err) = tokio::fs::write(cache_file_path, &bytes).await {
                 warn!("Failed to write cache file: {err}");
-            } else {
-                let mut lock = self.async_cached_file.lock().await;
-                *lock = Some(cache_file_path.clone());
             }
         }
 
@@ -269,9 +256,9 @@ pub enum DataSource {
     /// 与其它方式不同，FileMap 存储名称的映射表, 无需遍历目录
     FileMap(HashMap<String, SingleFileSource>),
 
-    ExternalSync(Box<dyn SyncFolderSource + Send + Sync>),
+    Sync(Box<dyn SyncFolderSource + Send + Sync>),
     #[cfg(feature = "tokio")]
-    ExternalAsync(Box<dyn AsyncFolderSource + Send + Sync>),
+    Async(Box<dyn AsyncFolderSource + Send + Sync>),
 }
 
 impl DataSource {
@@ -299,9 +286,9 @@ impl AsyncFolderSource for DataSource {
         file_name: &Path,
     ) -> io::Result<(Vec<u8>, Option<String>)> {
         match self {
-            DataSource::ExternalAsync(source) => source.get_file_content_async(file_name).await,
+            DataSource::Async(source) => source.get_file_content_async(file_name).await,
 
-            DataSource::ExternalSync(source) => source.get_file_content(file_name),
+            DataSource::Sync(source) => source.get_file_content(file_name),
             #[cfg(feature = "tar")]
             DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
 
@@ -355,10 +342,10 @@ impl SyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
     fn get_file_content(&self, file_name: &Path) -> io::Result<(Vec<u8>, Option<String>)> {
         match self {
-            DataSource::ExternalSync(source) => source.get_file_content(file_name),
+            DataSource::Sync(source) => source.get_file_content(file_name),
 
             #[cfg(feature = "tokio")]
-            DataSource::ExternalAsync(source) => {
+            DataSource::Async(source) => {
                 tokio::runtime::Handle::current().block_on(source.get_file_content_async(file_name))
             }
 
