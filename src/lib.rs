@@ -21,6 +21,7 @@ pub enum FetchError {
     S,
 }
 
+#[cfg(feature = "tokio")]
 #[async_trait::async_trait]
 pub trait AsyncSource {
     async fn fetch_async(&self) -> Result<Vec<u8>, FetchError>;
@@ -30,6 +31,7 @@ pub trait SyncSource {
     fn fetch(&self) -> Result<Vec<u8>, FetchError>;
 }
 
+#[cfg(feature = "tokio")]
 #[async_trait::async_trait]
 pub trait AsyncFolderSource: std::fmt::Debug {
     async fn get_file_content_async(
@@ -56,6 +58,7 @@ pub struct HttpSource {
     pub update_interval_seconds: Option<u64>,
 
     pub cached_file: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "tokio")]
     pub async_cached_file: Arc<tokio::sync::Mutex<Option<String>>>,
 
     pub cache_file_path: Option<String>,
@@ -104,6 +107,7 @@ impl HttpSource {
         }
     }
 }
+#[cfg(feature = "reqwest")]
 impl SyncSource for HttpSource {
     fn fetch(&self) -> Result<Vec<u8>, FetchError> {
         let ocf = { self.cached_file.lock().unwrap().take() };
@@ -155,6 +159,7 @@ impl SyncSource for HttpSource {
     }
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(feature = "reqwest")]
 impl HttpSource {
     pub async fn get_async(&self, client: reqwest::Client) -> reqwest::Result<reqwest::Response> {
@@ -178,6 +183,8 @@ impl HttpSource {
     }
 }
 
+#[cfg(feature = "tokio")]
+#[cfg(feature = "reqwest")]
 #[async_trait::async_trait]
 impl AsyncSource for HttpSource {
     async fn fetch_async(&self) -> Result<Vec<u8>, FetchError> {
@@ -263,6 +270,7 @@ pub enum DataSource {
     FileMap(HashMap<String, SingleFileSource>),
 
     ExternalSync(Box<dyn SyncFolderSource + Send + Sync>),
+    #[cfg(feature = "tokio")]
     ExternalAsync(Box<dyn AsyncFolderSource + Send + Sync>),
 }
 
@@ -282,6 +290,7 @@ impl DataSource {
         Ok(String::from_utf8_lossy(r.0.as_slice()).to_string())
     }
 }
+#[cfg(feature = "tokio")]
 #[async_trait::async_trait]
 impl AsyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
@@ -348,6 +357,7 @@ impl SyncFolderSource for DataSource {
         match self {
             DataSource::ExternalSync(source) => source.get_file_content(file_name),
 
+            #[cfg(feature = "tokio")]
             DataSource::ExternalAsync(source) => {
                 tokio::runtime::Handle::current().block_on(source.get_file_content_async(file_name))
             }
@@ -455,6 +465,7 @@ mod tests {
 
     const URL: &str = "https://www.rust-lang.org";
 
+    #[cfg(feature = "tokio")]
     #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_http_source_fetch_async() {
