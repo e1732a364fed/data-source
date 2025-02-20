@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    path::Path,
     sync::{Arc, Mutex},
     time::SystemTime,
 };
@@ -30,19 +31,18 @@ pub trait SyncSource {
 }
 
 #[async_trait::async_trait]
-pub trait AsyncFolderSource {
-    async fn get_file_content_async<P>(
+pub trait AsyncFolderSource: std::fmt::Debug {
+    async fn get_file_content_async(
         &self,
-        file_name: P,
-    ) -> io::Result<(Vec<u8>, Option<String>)>
-    where
-        P: AsRef<std::path::Path> + Send + Sync;
+        file_name: &std::path::Path,
+    ) -> io::Result<(Vec<u8>, Option<String>)>;
 }
 
-pub trait SyncFolderSource {
-    fn get_file_content<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
-    where
-        P: AsRef<std::path::Path>;
+pub trait SyncFolderSource: std::fmt::Debug {
+    fn get_file_content(
+        &self,
+        file_name: &std::path::Path,
+    ) -> io::Result<(Vec<u8>, Option<String>)>;
 }
 
 #[cfg(feature = "reqwest")]
@@ -250,7 +250,7 @@ impl Default for SingleFileSource {
 /// 很多配置中 都要再加载其他外部文件,
 /// FileSource 限定了 查找文件的 路径 和 来源, 读取文件时只会限制在这个范围内,
 /// 这样就增加了安全性
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub enum DataSource {
     #[default]
     StdReadFile,
@@ -261,6 +261,9 @@ pub enum DataSource {
 
     /// 与其它方式不同，FileMap 存储名称的映射表, 无需遍历目录
     FileMap(HashMap<String, SingleFileSource>),
+
+    ExternalSync(Box<dyn SyncFolderSource + Send + Sync>),
+    ExternalAsync(Box<dyn AsyncFolderSource + Send + Sync>),
 }
 
 impl DataSource {
@@ -275,24 +278,27 @@ impl DataSource {
     where
         P: AsRef<std::path::Path>,
     {
-        let r = SyncFolderSource::get_file_content(self, file_name)?;
+        let r = SyncFolderSource::get_file_content(self, file_name.as_ref())?;
         Ok(String::from_utf8_lossy(r.0.as_slice()).to_string())
     }
 }
 #[async_trait::async_trait]
 impl AsyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
-    async fn get_file_content_async<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
-    where
-        P: AsRef<std::path::Path> + Send + Sync,
-    {
+    async fn get_file_content_async(
+        &self,
+        file_name: &Path,
+    ) -> io::Result<(Vec<u8>, Option<String>)> {
         match self {
+            DataSource::ExternalAsync(source) => source.get_file_content_async(file_name).await,
+
+            DataSource::ExternalSync(source) => source.get_file_content(file_name),
             #[cfg(feature = "tar")]
             DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
 
             DataSource::Folders(possible_addrs) => {
                 for dir in possible_addrs {
-                    let real_file_name = std::path::Path::new(dir).join(file_name.as_ref());
+                    let real_file_name = std::path::Path::new(dir).join(file_name);
 
                     if real_file_name.exists() {
                         return tokio::fs::read(&real_file_name)
@@ -302,10 +308,7 @@ impl AsyncFolderSource for DataSource {
                 }
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!(
-                        "File not found in specified directories: {:?}",
-                        file_name.as_ref()
-                    ),
+                    format!("File not found in specified directories: {:?}", file_name),
                 ))
             }
             DataSource::StdReadFile => {
@@ -314,7 +317,7 @@ impl AsyncFolderSource for DataSource {
             }
 
             DataSource::FileMap(map) => {
-                let r = map.get(&file_name.as_ref().to_string_lossy().to_string());
+                let r = map.get(&file_name.to_string_lossy().to_string());
 
                 match r {
                     Some(sf) => match sf {
@@ -341,17 +344,20 @@ impl AsyncFolderSource for DataSource {
 
 impl SyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
-    fn get_file_content<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
-    where
-        P: AsRef<std::path::Path>,
-    {
+    fn get_file_content(&self, file_name: &Path) -> io::Result<(Vec<u8>, Option<String>)> {
         match self {
+            DataSource::ExternalSync(source) => source.get_file_content(file_name),
+
+            DataSource::ExternalAsync(source) => {
+                tokio::runtime::Handle::current().block_on(source.get_file_content_async(file_name))
+            }
+
             #[cfg(feature = "tar")]
             DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
 
             DataSource::Folders(possible_addrs) => {
                 for dir in possible_addrs {
-                    let real_file_name = std::path::Path::new(dir).join(file_name.as_ref());
+                    let real_file_name = std::path::Path::new(dir).join(file_name);
 
                     if real_file_name.exists() {
                         return std::fs::read(&real_file_name).map(|v| (v, Some(dir.to_owned())));
@@ -359,10 +365,7 @@ impl SyncFolderSource for DataSource {
                 }
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!(
-                        "File not found in specified directories: {:?}",
-                        file_name.as_ref()
-                    ),
+                    format!("File not found in specified directories: {:?}", file_name),
                 ))
             }
             DataSource::StdReadFile => {
@@ -371,7 +374,7 @@ impl SyncFolderSource for DataSource {
             }
 
             DataSource::FileMap(map) => {
-                let r = map.get(&file_name.as_ref().to_string_lossy().to_string());
+                let r = map.get(&file_name.to_string_lossy().to_string());
 
                 match r {
                     Some(sf) => match sf {
@@ -438,4 +441,99 @@ where
         result,
         Some(e.path().unwrap().to_str().unwrap().to_string()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[cfg(feature = "reqwest")]
+    use reqwest::blocking::Client;
+
+    const URL: &str = "https://www.rust-lang.org";
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_http_source_fetch_async() {
+        let http_source = HttpSource {
+            url: URL.to_string(),
+            should_use_proxy: false,
+            ..Default::default()
+        };
+
+        let result = http_source.fetch_async().await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn test_http_source_fetch() {
+        let http_source = HttpSource {
+            url: URL.to_string(),
+            should_use_proxy: false,
+            ..Default::default()
+        };
+
+        let client = Client::new();
+        let result = http_source.get(client);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_data_source_read_from_folders() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+
+        fs::write(&file_path, "hello world").unwrap();
+
+        let data_source = DataSource::Folders(vec![temp_dir.path().to_string_lossy().to_string()]);
+
+        let content = data_source.read_to_string("test.txt").unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_data_source_read_from_file_map() {
+        let file_map = vec![(
+            "config.json".to_string(),
+            SingleFileSource::Inline(b"{\"key\": \"value\"}".to_vec()),
+        )]
+        .into_iter()
+        .collect();
+
+        let data_source = DataSource::FileMap(file_map);
+
+        let content = data_source.read_to_string("config.json").unwrap();
+        assert_eq!(content, "{\"key\": \"value\"}");
+    }
+
+    #[cfg(feature = "tar")]
+    #[test]
+    fn test_get_file_from_tar() {
+        let temp_dir = TempDir::new().unwrap();
+        let tar_path = temp_dir.path().join("test.tar");
+
+        let mut tar_builder = tar::Builder::new(File::create(&tar_path).unwrap());
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "hello tar").unwrap();
+        let file_path = file.path().to_owned();
+
+        tar_builder
+            .append_path_with_name(&file_path, "test.txt")
+            .unwrap();
+        tar_builder.finish().unwrap();
+
+        let tar_data = fs::read(&tar_path).unwrap();
+        let result = get_file_from_tar("test.txt", &tar_data);
+
+        assert!(result.is_ok());
+        let (content, path) = result.unwrap();
+        assert_eq!(String::from_utf8_lossy(&content), "hello tar\n");
+        assert_eq!(path.unwrap(), "test.txt");
+    }
 }
