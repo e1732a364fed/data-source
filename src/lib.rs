@@ -20,6 +20,31 @@ pub enum FetchError {
     S,
 }
 
+#[async_trait::async_trait]
+pub trait AsyncSource {
+    async fn fetch_async(&self) -> Result<Vec<u8>, FetchError>;
+}
+
+pub trait SyncSource {
+    fn fetch(&self) -> Result<Vec<u8>, FetchError>;
+}
+
+#[async_trait::async_trait]
+pub trait AsyncFolderSource {
+    async fn get_file_content_async<P>(
+        &self,
+        file_name: P,
+    ) -> io::Result<(Vec<u8>, Option<String>)>
+    where
+        P: AsRef<std::path::Path> + Send + Sync;
+}
+
+pub trait SyncFolderSource {
+    fn get_file_content<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
+    where
+        P: AsRef<std::path::Path>;
+}
+
 #[cfg(feature = "reqwest")]
 #[derive(Clone, Debug, Default)]
 pub struct HttpSource {
@@ -31,12 +56,13 @@ pub struct HttpSource {
     pub update_interval_seconds: Option<u64>,
 
     pub cached_file: Arc<Mutex<Option<String>>>,
+    pub async_cached_file: Arc<tokio::sync::Mutex<Option<String>>>,
 
     pub cache_file_path: Option<String>,
 }
 #[cfg(feature = "reqwest")]
 impl HttpSource {
-    pub fn get_url(
+    pub fn get(
         &self,
         c: reqwest::blocking::Client,
     ) -> reqwest::Result<reqwest::blocking::Response> {
@@ -59,25 +85,32 @@ impl HttpSource {
         Ok(cb.proxy(proxy))
     }
 
-    pub fn fetch(&self) -> Result<Vec<u8>, FetchError> {
+    pub fn is_path_timeout(&self, cf: &str) -> Result<Option<bool>, FetchError> {
+        if std::fs::exists(cf)? {
+            let mut ok = true;
+            if let Some(uis) = self.update_interval_seconds {
+                let m = std::fs::metadata(cf)?;
+                let lu = m.modified()?;
+                let d = SystemTime::now().duration_since(lu)?.as_secs();
+                if d <= uis {
+                    let _ = self.cached_file.lock().unwrap().insert(cf.to_string());
+                } else {
+                    ok = false;
+                }
+            }
+            Ok(Some(!ok))
+        } else {
+            Ok(None)
+        }
+    }
+}
+impl SyncSource for HttpSource {
+    fn fetch(&self) -> Result<Vec<u8>, FetchError> {
         let ocf = { self.cached_file.lock().unwrap().take() };
         if let Some(cf) = &ocf {
-            if std::fs::exists(cf)? {
-                let mut ok = true;
-                if let Some(uis) = self.update_interval_seconds {
-                    let m = std::fs::metadata(cf)?;
-                    let lu = m.modified()?;
-                    let d = SystemTime::now().duration_since(lu)?.as_secs();
-                    if d <= uis {
-                        let _ = self.cached_file.lock().unwrap().insert(cf.to_string());
-                    } else {
-                        ok = false;
-                    }
-                }
-                if ok {
-                    let s = std::fs::read_to_string(cf)?;
-                    return Ok(s.into_bytes());
-                }
+            if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
+                let s: Vec<u8> = std::fs::read(cf)?;
+                return Ok(s);
             }
         }
 
@@ -86,7 +119,7 @@ impl HttpSource {
             cb = self.set_proxy(cb)?;
         }
         let c = cb.build()?;
-        let r = self.get_url(c);
+        let r = self.get(c);
         let r = match r {
             Ok(r) => r,
             Err(e) => {
@@ -94,7 +127,7 @@ impl HttpSource {
                     let mut cb = reqwest::blocking::ClientBuilder::new();
                     cb = self.set_proxy(cb)?;
                     let c = cb.build()?;
-                    self.get_url(c)?
+                    self.get(c)?
                 } else {
                     return Err(FetchError::R(e));
                 }
@@ -119,6 +152,84 @@ impl HttpSource {
             }
         }
         Ok(v)
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl HttpSource {
+    pub async fn get_async(&self, client: reqwest::Client) -> reqwest::Result<reqwest::Response> {
+        let mut request = client.get(&self.url);
+        if let Some(headers) = &self.custom_request_headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+        request.send().await
+    }
+
+    pub fn set_proxy_async(
+        &self,
+        client_builder: reqwest::ClientBuilder,
+    ) -> reqwest::Result<reqwest::ClientBuilder> {
+        let proxy = self.proxy.as_ref().unwrap();
+        let client_builder = client_builder.proxy(reqwest::Proxy::http(proxy)?);
+        let client_builder = client_builder.proxy(reqwest::Proxy::https(proxy)?);
+        Ok(client_builder)
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncSource for HttpSource {
+    async fn fetch_async(&self) -> Result<Vec<u8>, FetchError> {
+        let ocf = { self.async_cached_file.lock().await.clone() };
+        if let Some(cf) = &ocf {
+            if self.is_path_timeout(cf)?.is_some_and(|timeout| !timeout) {
+                let content = tokio::fs::read(cf).await?;
+                return Ok(content);
+            }
+        }
+
+        let client_builder = reqwest::ClientBuilder::new();
+        let client_builder = if self.should_use_proxy {
+            self.set_proxy_async(client_builder)?
+        } else {
+            client_builder
+        };
+        let client = client_builder.build()?;
+
+        let r = self.get_async(client).await;
+        let response = match r {
+            Ok(r) => r,
+            Err(e) => {
+                if !self.should_use_proxy && self.proxy.is_some() {
+                    let mut cb = reqwest::ClientBuilder::new();
+                    cb = self.set_proxy_async(cb)?;
+                    let c = cb.build()?;
+                    self.get_async(c).await?
+                } else {
+                    return Err(FetchError::R(e));
+                }
+            }
+        };
+        if let Some(size_limit) = self.size_limit_bytes {
+            if let Some(content_length) = response.content_length() {
+                if content_length as usize > size_limit {
+                    return Err(FetchError::S);
+                }
+            }
+        }
+
+        let bytes = response.bytes().await?.to_vec();
+        if let Some(cache_file_path) = &self.cache_file_path {
+            if let Err(err) = tokio::fs::write(cache_file_path, &bytes).await {
+                warn!("Failed to write cache file: {err}");
+            } else {
+                let mut lock = self.async_cached_file.lock().await;
+                *lock = Some(cache_file_path.clone());
+            }
+        }
+
+        Ok(bytes)
     }
 }
 
@@ -164,12 +275,73 @@ impl DataSource {
     where
         P: AsRef<std::path::Path>,
     {
-        let r = self.get_file_content(file_name)?;
+        let r = SyncFolderSource::get_file_content(self, file_name)?;
         Ok(String::from_utf8_lossy(r.0.as_slice()).to_string())
     }
-
+}
+#[async_trait::async_trait]
+impl AsyncFolderSource for DataSource {
     /// 返回读到的 数据。可能还会返回 成功找到的路径
-    pub fn get_file_content<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
+    async fn get_file_content_async<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
+    where
+        P: AsRef<std::path::Path> + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "tar")]
+            DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
+
+            DataSource::Folders(possible_addrs) => {
+                for dir in possible_addrs {
+                    let real_file_name = std::path::Path::new(dir).join(file_name.as_ref());
+
+                    if real_file_name.exists() {
+                        return tokio::fs::read(&real_file_name)
+                            .await
+                            .map(|v| (v, Some(dir.to_owned())));
+                    }
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "File not found in specified directories: {:?}",
+                        file_name.as_ref()
+                    ),
+                ))
+            }
+            DataSource::StdReadFile => {
+                let s: Vec<u8> = tokio::fs::read(file_name).await?;
+                Ok((s, None))
+            }
+
+            DataSource::FileMap(map) => {
+                let r = map.get(&file_name.as_ref().to_string_lossy().to_string());
+
+                match r {
+                    Some(sf) => match sf {
+                        #[cfg(feature = "reqwest")]
+                        SingleFileSource::Http(http_source) => {
+                            let r = http_source.fetch_async().await;
+                            match r {
+                                Ok(v) => Ok((v, None)),
+                                Err(e) => Err(io::Error::other(e)),
+                            }
+                        }
+                        SingleFileSource::FilePath(f) => {
+                            let s: Vec<u8> = tokio::fs::read(f).await?;
+                            Ok((s, Some(f.to_string())))
+                        }
+                        SingleFileSource::Inline(v) => Ok((v.clone(), None)),
+                    },
+                    None => Err(io::Error::new(io::ErrorKind::NotFound, "")),
+                }
+            }
+        }
+    }
+}
+
+impl SyncFolderSource for DataSource {
+    /// 返回读到的 数据。可能还会返回 成功找到的路径
+    fn get_file_content<P>(&self, file_name: P) -> io::Result<(Vec<u8>, Option<String>)>
     where
         P: AsRef<std::path::Path>,
     {
@@ -194,8 +366,8 @@ impl DataSource {
                 ))
             }
             DataSource::StdReadFile => {
-                let s = std::fs::read_to_string(file_name)?;
-                Ok((s.into_bytes(), None))
+                let s: Vec<u8> = std::fs::read(file_name)?;
+                Ok((s, None))
             }
 
             DataSource::FileMap(map) => {
@@ -212,8 +384,8 @@ impl DataSource {
                             }
                         }
                         SingleFileSource::FilePath(f) => {
-                            let s = std::fs::read_to_string(f)?;
-                            Ok((s.into_bytes(), None))
+                            let s: Vec<u8> = std::fs::read(f)?;
+                            Ok((s, Some(f.to_string())))
                         }
                         SingleFileSource::Inline(v) => Ok((v.clone(), None)),
                     },
