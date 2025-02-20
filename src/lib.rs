@@ -136,6 +136,32 @@ pub trait SyncFolderSource: std::fmt::Debug {
     ) -> Result<(Vec<u8>, Option<String>), FetchError>;
 }
 
+#[cfg(feature = "tar")]
+#[derive(Clone, Debug, Default)]
+pub struct TarFile(pub String);
+
+#[cfg(feature = "tar")]
+impl SyncFolderSource for TarFile {
+    fn get_file_content(
+        &self,
+        file_name: &std::path::Path,
+    ) -> Result<(Vec<u8>, Option<String>), FetchError> {
+        let f = std::fs::File::open(&self.0)?;
+        get_file_from_tar_by_reader(file_name, f)
+    }
+}
+#[cfg(feature = "tokio-tar")]
+#[async_trait::async_trait]
+impl AsyncFolderSource for TarFile {
+    async fn get_file_content_async(
+        &self,
+        file_name: &std::path::Path,
+    ) -> Result<(Vec<u8>, Option<String>), FetchError> {
+        let f = tokio::fs::File::open(&self.0).await?;
+        get_file_from_tar_by_reader_async(file_name, f).await
+    }
+}
+
 #[cfg(feature = "reqwest")]
 #[derive(Clone, Debug, Default)]
 pub struct HttpSource {
@@ -343,10 +369,13 @@ impl SyncSource for SingleFileSource {
 pub enum DataSource {
     #[default]
     StdReadFile,
-    Folders(Vec<String>), //从指定的一组路径来寻找文件
-
+    ///从指定的一组路径来寻找文件
+    Folders(Vec<String>),
+    /// 从一个 已放到内存中的 tar 中 寻找文件
     #[cfg(feature = "tar")]
-    Tar(Vec<u8>), // 从一个 已放到内存中的 tar 中 寻找文件
+    TarInMemory(Vec<u8>),
+    #[cfg(feature = "tar")]
+    TarFile(TarFile),
 
     /// 与其它方式不同，FileMap 存储名称的映射表, 无需遍历目录
     FileMap(HashMap<String, SingleFileSource>),
@@ -385,7 +414,11 @@ impl AsyncFolderSource for DataSource {
 
             DataSource::Sync(source) => source.get_file_content(file_name),
             #[cfg(feature = "tar")]
-            DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
+            DataSource::TarInMemory(tar_binary) => {
+                get_file_from_tar_in_memory(file_name, tar_binary)
+            }
+            #[cfg(feature = "tokio-tar")]
+            DataSource::TarFile(tf) => tf.get_file_content_async(file_name).await,
 
             DataSource::Folders(possible_addrs) => {
                 for dir in possible_addrs {
@@ -428,7 +461,11 @@ impl SyncFolderSource for DataSource {
             }
 
             #[cfg(feature = "tar")]
-            DataSource::Tar(tar_binary) => get_file_from_tar(file_name, tar_binary),
+            DataSource::TarInMemory(tar_binary) => {
+                get_file_from_tar_in_memory(file_name, tar_binary)
+            }
+            #[cfg(feature = "tar")]
+            DataSource::TarFile(tf) => tf.get_file_content(file_name),
 
             DataSource::Folders(possible_addrs) => {
                 for dir in possible_addrs {
@@ -459,21 +496,46 @@ impl SyncFolderSource for DataSource {
     }
 }
 
-#[cfg(feature = "tar")]
-pub fn get_file_from_tar<P>(
+#[cfg(feature = "tokio-tar")]
+pub async fn get_file_from_tar_by_reader_async<P, R>(
     file_name_in_tar: P,
-    tar_binary: &Vec<u8>,
+    reader: R,
 ) -> Result<(Vec<u8>, Option<String>), FetchError>
 where
     P: AsRef<std::path::Path>,
+    R: tokio::io::AsyncRead + Unpin,
 {
-    let mut a = tar::Archive::new(std::io::Cursor::new(tar_binary));
+    let mut a = tokio_tar::Archive::new(reader);
 
-    debug!(
-        "finding {} from tar, tar whole size is {}",
-        file_name_in_tar.as_ref().to_str().unwrap(),
-        tar_binary.len()
-    );
+    let mut es = a.entries().unwrap();
+
+    use futures::StreamExt;
+    use tokio::io::AsyncReadExt;
+
+    while let Some(file) = es.next().await {
+        let mut f = file.unwrap();
+        let p = f.path().unwrap();
+        if p.eq(file_name_in_tar.as_ref()) {
+            debug!("found {}", file_name_in_tar.as_ref().to_str().unwrap());
+            let ps = p.to_string_lossy().to_string();
+            let mut result = vec![];
+
+            f.read_to_end(&mut result).await?;
+            return Ok((result, Some(ps)));
+        }
+    }
+    Err(FetchError::NF)
+}
+#[cfg(feature = "tar")]
+pub fn get_file_from_tar_by_reader<P, R>(
+    file_name_in_tar: P,
+    reader: R,
+) -> Result<(Vec<u8>, Option<String>), FetchError>
+where
+    P: AsRef<std::path::Path>,
+    R: std::io::Read,
+{
+    let mut a = tar::Archive::new(reader);
 
     let mut e = a
         .entries()
@@ -501,6 +563,22 @@ where
         result,
         Some(e.path().unwrap().to_str().unwrap().to_string()),
     ))
+}
+#[cfg(feature = "tar")]
+pub fn get_file_from_tar_in_memory<P>(
+    file_name_in_tar: P,
+    tar_binary: &Vec<u8>,
+) -> Result<(Vec<u8>, Option<String>), FetchError>
+where
+    P: AsRef<std::path::Path>,
+{
+    debug!(
+        "finding {} from tar, tar whole size is {}",
+        file_name_in_tar.as_ref().to_str().unwrap(),
+        tar_binary.len()
+    );
+    let r = std::io::Cursor::new(tar_binary);
+    get_file_from_tar_by_reader(file_name_in_tar, r)
 }
 
 #[cfg(test)]
@@ -571,30 +649,52 @@ mod tests {
         let content = data_source.read_to_string("config.json").unwrap();
         assert_eq!(content, "{\"key\": \"value\"}");
     }
-
+    use std::path::PathBuf;
     #[cfg(feature = "tar")]
-    #[test]
-    fn test_get_file_from_tar() {
+    fn gentar() -> (TempDir, PathBuf, &'static str, &'static str) {
         let temp_dir = TempDir::new().unwrap();
         let tar_path = temp_dir.path().join("test.tar");
 
         let mut tar_builder = tar::Builder::new(File::create(&tar_path).unwrap());
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "hello tar").unwrap();
+        let c = "hello tar\n";
+        write!(file, "{}", c).unwrap();
         let file_path = file.path().to_owned();
 
-        tar_builder
-            .append_path_with_name(&file_path, "test.txt")
-            .unwrap();
+        let tfn = "test.txt";
+
+        tar_builder.append_path_with_name(&file_path, tfn).unwrap();
         tar_builder.finish().unwrap();
 
+        (temp_dir, tar_path, tfn, c)
+    }
+
+    #[cfg(feature = "tar")]
+    #[test]
+    fn test_get_file_from_tar() {
+        let (_td, tar_path, tfn, c) = gentar(); // 不能命名为 _,
+                                                // 后面要加长，不然变量会被自动drop掉, Tempdir drop时会自动删除里面的内容
+
         let tar_data = fs::read(&tar_path).unwrap();
-        let result = get_file_from_tar("test.txt", &tar_data);
+        let result = get_file_from_tar_in_memory(tfn, &tar_data);
 
         assert!(result.is_ok());
         let (content, path) = result.unwrap();
-        assert_eq!(String::from_utf8_lossy(&content), "hello tar\n");
-        assert_eq!(path.unwrap(), "test.txt");
+        assert_eq!(String::from_utf8_lossy(&content), c);
+        assert_eq!(path.unwrap(), tfn);
+    }
+    #[cfg(feature = "tokio-tar")]
+    #[tokio::test]
+    async fn test_get_file_from_tar_async() -> Result<(), FetchError> {
+        let (_td, tar_path, tfn, c) = gentar();
+
+        let f = tokio::fs::File::open(tar_path).await?;
+        let result = get_file_from_tar_by_reader_async(tfn, f).await?;
+
+        let (content, path) = result;
+        assert_eq!(String::from_utf8_lossy(&content), c);
+        assert_eq!(path.unwrap(), tfn);
+        Ok(())
     }
 }
