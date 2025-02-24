@@ -21,6 +21,20 @@ pub enum FetchError {
     NFD(Vec<String>),
 }
 
+impl From<FetchError> for io::Error {
+    fn from(value: FetchError) -> Self {
+        match value {
+            FetchError::R(error) => io::Error::other(error),
+            FetchError::I(error) => error,
+            FetchError::T(error) => io::Error::other(error),
+            FetchError::S => io::Error::other(value.to_string()),
+            FetchError::NC => io::Error::other(value.to_string()),
+            FetchError::NF => io::Error::new(io::ErrorKind::NotFound, ""),
+            FetchError::NFD(_) => io::Error::other(value.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileCache {
     pub update_interval_seconds: Option<u64>,

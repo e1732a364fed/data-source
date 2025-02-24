@@ -1,6 +1,6 @@
 [package]
 name = "data-source"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 categories = ["data-structures"]
 keywords = ["clash"]
@@ -11,14 +11,14 @@ homepage = "https://github.com/e1732a364fed/data-source"
 repository = "https://github.com/e1732a364fed/data-source"
 
 [dependencies]
-log = "0.4.25"
-tar = { version = "0.4.43", optional = true }
+log = "0.4"
+tar = { version = "0.4", optional = true }
 reqwest = { version = "0.12", optional = true, features = ["blocking"] }
-thiserror = "2.0.11"
-tokio = { version = "1.43.0", optional = true, features = ["full"] }
-futures = { version = "0.3.31", optional = true }
-astral-tokio-tar = { version = "0.5.1", optional = true }
-async-trait = { version = "0.1.86", optional = true }
+thiserror = "2"
+tokio = { version = "1", optional = true, features = ["full"] }
+futures = { version = "0.3", optional = true }
+astral-tokio-tar = { version = "0.5", optional = true }
+async-trait = { version = "0.1", optional = true }
 
 [features]
 default = ["reqwest", "tokio-tar"]
@@ -26,4 +26,4 @@ tokio = ["futures", "async-trait", "dep:tokio"]
 tokio-tar = ["tokio", "tar", "dep:astral-tokio-tar"]
 
 [dev-dependencies]
-tempfile = "3.17.1"
+tempfile = "3.17"
