@@ -1,3 +1,6 @@
+#[cfg(feature = "file_server")]
+pub mod file_server;
+
 use std::{collections::HashMap, io, path::Path, time::SystemTime};
 
 use log::{debug, warn};
