@@ -53,7 +53,7 @@ where
                     .unwrap());
             }
 
-            let path = req.uri().path().trim_start_matches("/files");
+            let path = req.uri().path().trim_start_matches("/files/");
             let path = Path::new(path);
 
             let result = data_source.get_file_content_async(path).await;
