@@ -78,7 +78,14 @@ where
                         _ => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     let body = UnsyncBoxBody::new(
-                        Full::new(Bytes::from(status.to_string() + &e.to_string())).map_err(|_| {
+                        Full::new(Bytes::from(
+                            status.to_string()
+                                + "\n\n"
+                                + &path.to_string_lossy().to_string()
+                                + "\n\n"
+                                + &e.to_string(),
+                        ))
+                        .map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::Other, "stream error")
                         }),
                     );
