@@ -1,7 +1,3 @@
-/*
-
-*/
-
 use crate::*;
 use axum::{
     body::Bytes,
@@ -57,11 +53,9 @@ where
                     .unwrap());
             }
 
-            // 解析请求路径
             let path = req.uri().path().trim_start_matches('/');
             let path = Path::new(path);
 
-            // 获取文件内容
             let result = data_source.get_file_content_async(path).await;
 
             // 构建响应
@@ -83,10 +77,11 @@ where
                         FetchError::S => StatusCode::PAYLOAD_TOO_LARGE,
                         _ => StatusCode::INTERNAL_SERVER_ERROR,
                     };
-                    let body =
-                        UnsyncBoxBody::new(Full::new(Bytes::from(status.to_string())).map_err(
-                            |_| std::io::Error::new(std::io::ErrorKind::Other, "stream error"),
-                        ));
+                    let body = UnsyncBoxBody::new(
+                        Full::new(Bytes::from(status.to_string() + &e.to_string())).map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "stream error")
+                        }),
+                    );
                     Ok(Response::builder().status(status).body(body).unwrap())
                 }
             }
@@ -94,7 +89,6 @@ where
     }
 }
 
-// 支持路径参数提取（需要 axum 的 extract 特性）
 use axum::extract::Path as AxumPath;
 
 pub async fn handle_file_request(
@@ -108,7 +102,6 @@ pub async fn handle_file_request(
     service.call(req).await.unwrap()
 }
 
-// 注册到 Axum 路由
 pub fn register_data_source_route(
     app: axum::Router,
     path: &str,
