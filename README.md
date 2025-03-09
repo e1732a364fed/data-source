@@ -1,6 +1,6 @@
-a simple crate that fetches data from different sources
+A simple crate that fetches data from different sources
 
-supports tar, http, folders(as search paths), std::fs
+Supports tar, http, folders(as search paths), std::fs, and traits.
 
 
 Has a "file_server" feature, to serve files inside DataSource using axum:
