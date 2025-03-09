@@ -10,7 +10,7 @@ use data_source::DataSource;
 use data_source::file_server::*;
 let mut data_source = DataSource::FileMap(Default::default());
 let app = axum::Router::new();
-let app = register_data_source_route(app,  "/files/*path", data_source);
+let app = register_data_source_route(app,  "/files/{*path}", data_source);
 
 ```
 
@@ -33,7 +33,7 @@ async fn handle_file_request_wrapper(
 }
 
 app = app.route(
-    "/files/*path",
+    "/files/{*path}",
     get(handle_file_request_wrapper).with_state(service),
 );
 ```
